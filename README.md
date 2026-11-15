@@ -1,52 +1,71 @@
-# VectorCoin API (Railway)
+# VectorCoin — собственный backend
 
-Node.js + Express + PostgreSQL + Socket.IO. All wallet mutations are performed on the server inside PostgreSQL transactions. The Android client never changes balances locally.
+Node.js 20+, Express, PostgreSQL 16, JWT, bcrypt, Socket.IO.
 
-## Railway deployment / update
+## Что реализовано
+- Регистрация участника и вход по email/паролю.
+- Пароли хранятся только в виде bcrypt-хеша.
+- JWT-доступ к API.
+- События и команды из исходного HTML перенесены в seed.
+- Вступление участника в команду.
+- Начисление монет учителем только на закреплённом за ним мероприятии.
+- Обновление баланса и запись транзакции выполняются в одной транзакции PostgreSQL.
+- Socket.IO уведомляет подключённых клиентов о новых балансах/операциях.
+- Ограничение суммы начисления и проверка входных данных.
 
-1. Push the contents of this `server` directory to the GitHub repository connected to Railway (repository root should contain `Dockerfile`, `package.json`, `src/` and `db/`).
-2. Keep the existing Railway PostgreSQL service and its `DATABASE_URL` reference.
-3. Keep `JWT_SECRET` (32+ random characters), `SEED_TEACHER_EMAIL`, and `SEED_TEACHER_PASSWORD` configured in Railway Variables. Do not commit `.env` or secrets.
-4. Deploy. `src/index.js` applies the idempotent SQL schema before listening. Existing users and existing event memberships are retained. The first migration copies old global balances into memberships in the legacy `test` event once; new balances are event-specific.
-5. Open `https://YOUR-RAILWAY-DOMAIN/health`; expect `{ "ok": true, "service": "VectorCoin API" }`.
+## Локальный запуск (Docker)
+1. Установите Docker Desktop.
+2. Скопируйте `.env.example` в `.env`.
+3. Заполните `POSTGRES_PASSWORD`, `JWT_SECRET` (длинная случайная строка), `CORS_ORIGIN`.
+4. Чтобы создать первого учителя, задайте `SEED_TEACHER_EMAIL` и `SEED_TEACHER_PASSWORD` в `.env`.
+5. `docker compose up --build -d`
+6. Проверка: `curl http://localhost:3000/health`
 
-## Roles and event workflow
+Пример `.env`:
+```
+POSTGRES_PASSWORD=replace-this-long-db-password
+JWT_SECRET=replace-with-a-random-secret-at-least-32-characters
+PORT=3000
+NODE_ENV=production
+CORS_ORIGIN=https://YOUR_DOMAIN
+SEED_TEACHER_EMAIL=teacher@example.org
+SEED_TEACHER_PASSWORD=use-a-long-unique-password
+```
+После первого запуска удалите `SEED_TEACHER_PASSWORD` из `.env` и перезапустите контейнер API.
 
-- Registration creates participant accounts only. Teacher accounts are provisioned by an administrator through the seed variables or directly in the database.
-- A teacher creates an event with `POST /api/events`. The creating teacher is assigned to that event.
-- Participants see active events in `GET /api/events` and explicitly join with `POST /api/events/:eventId/join`.
-- Each event membership has its own balance (`event_participants.balance`).
+## Важная настройка роли учителя
+Открытая регистрация учителем запрещена. Первый учитель создаётся через seed. Новых учителей добавляйте администратором, затем связывайте их с мероприятиями через `event_teachers`. Не выдавайте роль teacher публичным endpoint'ом.
 
-## Wallet and QR rules
-
-- Every user has a random, server-generated `qr_token`. `GET /api/qr/me` returns the payload for their personal QR. The QR identifies the user only; it is not a payment authorization credential.
-- A participant can transfer coins to another participant in the same event.
-- A teacher assigned to an event can credit or debit a participant in that event.
-- QR and manual operations use `POST /api/events/:eventId/operations`.
-- Every successful credit, debit, or transfer updates balances and inserts an immutable audit row in `transactions` in the same SQL transaction. If the ledger insert fails, the balance update rolls back too.
-- The API checks event membership, teacher permissions, positive integer amounts, sufficient balance, and prevents self-transfers. QR operations require an authenticated user and explicit in-app confirmation.
-- `GET /api/events/:eventId/transactions` returns the event audit history. Socket.IO broadcasts refresh notifications only; PostgreSQL remains the source of truth.
-
-## Main endpoints
-
-- `POST /api/auth/register`, `POST /api/auth/login`, `GET /api/auth/me`
-- `GET /api/events`, `POST /api/events`, `POST /api/events/:eventId/join`, `GET /api/events/:eventId`
-- `GET /api/events/:eventId/wallet`, `GET /api/events/:eventId/participants?search=name-or-email`
-- `GET /api/events/:eventId/transactions`
-- `GET /api/qr/me`, `GET /api/qr/resolve/:token`
-- `POST /api/events/:eventId/operations`
-
-Operation request examples:
-
-```json
-{"action":"transfer","target_user_id":"USER_UUID","amount":15,"method":"manual"}
-{"action":"credit","qr_payload":"VECTORCOIN:USER:QR_TOKEN","amount":25,"method":"qr"}
-{"action":"debit","target_user_id":"USER_UUID","amount":5,"method":"manual"}
+Пример SQL для второго учителя:
+```
+UPDATE users SET role='teacher' WHERE email='second@example.org';
+INSERT INTO event_teachers(event_id,teacher_id)
+SELECT e.id,u.id FROM events e CROSS JOIN users u
+WHERE e.name='Хакатон «Код будущего»' AND u.email='second@example.org'
+ON CONFLICT DO NOTHING;
 ```
 
-## Security notes
+## Развёртывание в интернете
+Размещайте API за HTTPS reverse proxy (Caddy/Nginx/Traefik), не публикуйте порт PostgreSQL.
+Укажите публичный адрес `https://api.example.org` в `android/app/src/main/assets/config.js`.
+В `CORS_ORIGIN` перечислите web-origin приложения/админки. Для Android WebView запросы идут с локального origin; при необходимости разрешите `null` origin на уровне reverse proxy/CORS только после оценки риска. Токен передаётся в Authorization header и Socket.IO handshake.
+Сделайте резервное копирование PostgreSQL и настройте firewall, обновления ОС и мониторинг.
 
-- Use HTTPS on Railway. Never expose `DATABASE_URL` or `JWT_SECRET` in the Android app.
-- Do not make the QR token an authorization secret: it only identifies the account. The API always authenticates the actor and checks role, event membership, and balance.
-- For production deployment, restrict `CORS_ORIGIN` to trusted web origins if serving a web client. The Android WebView uses the fixed secure local origin `https://appassets.androidplatform.net`, which is explicitly allowed by the API and Socket.IO CORS configuration.
-- Consider adding email verification, password recovery, rate limiting, and a teacher administration workflow before public launch.
+## API
+- `POST /api/auth/register` `{email,password,display_name,role:"participant"}`
+- `POST /api/auth/login` `{email,password}`
+- `GET /api/auth/me`
+- `GET /api/events`
+- `GET /api/events/:eventId/teams`
+- `GET /api/teams`
+- `POST /api/teams/:teamId/join`
+- `POST /api/teams/:teamId/credit` `{amount,method:"manual"}` — только учитель, закреплённый за событием
+- `GET /api/events/:eventId/transactions`
+
+Realtime: Socket.IO `team:subscribe` с `{teamId}`; сервер шлёт `team:updated` и `transaction:created`.
+
+## Ограничения текущего этапа
+- NFC и настоящий QR не подключены: в исходном HTML QR был CSS-макетом, а не кодом.
+- Покупки/списание монет не реализованы в исходном интерфейсе, поэтому здесь не добавлялись.
+- Учительская регистрация через приложение намеренно закрыта.
+- Для production рекомендуется добавить подтверждение email, rate limiting, refresh tokens, аудит админских действий и тесты.
